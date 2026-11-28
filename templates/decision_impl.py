@@ -92,7 +92,48 @@ def score_event(event: dict, baseline: dict, threshold: str, contract: dict) -> 
         5. Fresh event with Decimal(score_str) >= Decimal(str(threshold)) -> {"score": score_str, "route": "ALERT", "reason": "THRESHOLD"}
         6. Otherwise -> {"score": score_str, "route": "NORMAL", "reason": "BELOW_THRESHOLD"}
     """
-    raise NotImplementedError("T2: implement score_event")
+    from datetime import datetime, timezone
+    from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+    def timestamp(value):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError("timestamp must include a timezone")
+            return parsed.astimezone(timezone.utc)
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid timestamp") from exc
+
+    # Step 1: missing sensor or too little history.
+    stats = baseline.get(event["sensor_id"])
+    if stats is None or stats["n"] < contract["min_baseline_rows"]:
+        return {"score": None, "route": "HOLD", "reason": "INSUFFICIENT_BASELINE"}
+
+    # Step 2: unparseable, non-finite, or out-of-range temperature.
+    minimum = Decimal(str(contract["min_temperature_c"]))
+    maximum = Decimal(str(contract["max_temperature_c"]))
+    try:
+        value = Decimal(str(event["temperature_c"]))
+        valid = value.is_finite() and minimum <= value <= maximum
+    except (InvalidOperation, TypeError, ValueError):
+        valid = False
+    if not valid:
+        return {"score": None, "route": "HOLD", "reason": "INVALID_VALUE"}
+
+    # Step 3: robust z-score, rounded half-up to 6 decimals BEFORE any comparison.
+    places = Decimal(1).scaleb(-int(contract["score_decimal_places"]))
+    raw = abs(value - Decimal(stats["median_c"])) / Decimal(stats["scale_c"])
+    score = format(raw.quantize(places, rounding=ROUND_HALF_UP), f".{int(contract['score_decimal_places'])}f")
+
+    # Step 4: arrival lag (score is kept for late rows).
+    lag = (timestamp(event["ingest_time_utc"]) - timestamp(event["event_time_utc"])).total_seconds()
+    if lag > contract["late_limit_seconds"]:
+        return {"score": score, "route": "HOLD", "reason": "LATE_FOR_ACTION"}
+
+    # Steps 5-6: timely rows are compared with the threshold (score >= threshold).
+    if Decimal(score) >= Decimal(str(threshold)):
+        return {"score": score, "route": "ALERT", "reason": "THRESHOLD"}
+    return {"score": score, "route": "NORMAL", "reason": "BELOW_THRESHOLD"}
 
 
 def evaluate(predictions: list[dict], labels: dict[str, int], contract: dict) -> dict:
@@ -110,7 +151,61 @@ def evaluate(predictions: list[dict], labels: dict[str, int], contract: dict) ->
         - Include held_positive in positive_total for end_to_end_recall = tp / positive_total.
         - cost_units = 50*fn + 10*fp + 2*alerts + 10*hold; cost = cost_units / 10.
     """
-    raise NotImplementedError("T2: implement evaluate")
+    ids = [item["record_id"] for item in predictions]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate prediction record_id")
+    if set(ids) != set(labels):
+        raise ValueError("predictions and labels do not match 1-to-1")
+    if any(value not in (0, 1) for value in labels.values()):
+        raise ValueError("labels must be 0 or 1")
+
+    tp = fp = tn = fn = hold = held_positive = 0
+    for item in predictions:
+        route = item["route"]
+        positive = labels[item["record_id"]] == 1
+        if route == "ALERT":
+            tp, fp = tp + positive, fp + (not positive)
+        elif route == "NORMAL":
+            fn, tn = fn + positive, tn + (not positive)
+        elif route == "HOLD":
+            hold += 1
+            held_positive += positive
+        else:
+            raise ValueError("unknown route")
+
+    def ratio(numerator, denominator):
+        return numerator / denominator if denominator else None
+
+    n = len(predictions)
+    eligible = tp + fp + tn + fn
+    alerts = tp + fp
+    positive_total = sum(labels.values())
+    weights = contract["cost_units"]
+    cost_units = (
+        weights["false_negative"] * fn
+        + weights["false_positive"] * fp
+        + weights["alert_review"] * alerts
+        + weights["hold_review"] * hold
+    )
+    return {
+        "n": n,
+        "eligible": eligible,
+        "hold": hold,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "alerts": alerts,
+        "positive_total": positive_total,
+        "held_positive": held_positive,
+        "precision": ratio(tp, tp + fp),
+        "recall": ratio(tp, tp + fn),
+        "f1": ratio(2 * tp, 2 * tp + fp + fn),
+        "coverage": ratio(eligible, n),
+        "end_to_end_recall": ratio(tp, positive_total),
+        "cost_units": cost_units,
+        "cost": cost_units / contract["cost_display_divisor"],
+    }
 
 
 def make_action_key(team_id: str, event: dict, policy_id: str) -> str:

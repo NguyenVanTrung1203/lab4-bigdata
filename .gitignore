@@ -1,0 +1,15 @@
+# --- Starter của giảng viên (không push) ---
+/Lab4-Student-Starter.zip
+/requirements.txt
+/config/
+/data/
+/manifests/
+/notebooks/
+/schemas/
+/src/
+/tools/
+
+# --- Kết quả chạy local ---
+/work/
+__pycache__/
+*.pyc
